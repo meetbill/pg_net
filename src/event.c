@@ -116,6 +116,20 @@ int multi_socket_cb(__attribute__((unused)) CURL *easy, curl_socket_t sockfd, in
   if (epoll_ctl(wstate->epfd, epoll_op, sockfd, &ev) < 0) {
     int          e        = errno;
     static char *opstrs[] = {"NONE", "EPOLL_CTL_ADD", "EPOLL_CTL_DEL", "EPOLL_CTL_MOD"};
+
+    // When libcurl closes a socket before handing us the CURL_POLL_REMOVE event
+    // (this happens when a connection is closed/reset by the peer or the network
+    // path, common for outbound requests over an unstable egress), the kernel has
+    // already removed the fd from the epoll set on close(). A subsequent
+    // EPOLL_CTL_DEL then fails with EBADF. That is not an error for us: the fd we
+    // wanted to remove is already gone, which is exactly the desired state. Treat
+    // it as a no-op instead of crashing the whole worker in a restart loop.
+    if (epoll_op == EPOLL_CTL_DEL && e == EBADF) {
+      elog(DEBUG2, "multi_socket_cb: EPOLL_CTL_DEL for sockfd %d returned EBADF, "
+                   "socket already closed by libcurl, ignoring", sockfd);
+      return 0;
+    }
+
     ereport(ERROR, errmsg("epoll_ctl with %s failed when receiving %s for sockfd %d: %s",
                           whatstrs[what], opstrs[epoll_op], sockfd, strerror(e)));
   }
