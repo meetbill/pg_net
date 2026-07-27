@@ -11,6 +11,7 @@
 #include "core.h"
 #include "errors.h"
 #include "event.h"
+#include "ip_filter.h"
 #include "util.h"
 
 #define MIN_LIBCURL_VERSION_NUM                                                                    \
@@ -507,4 +508,22 @@ void _PG_init(void) {
 
   DefineCustomStringVariable("pg_net.username", "Connection user for the worker", NULL,
                              &guc_username, NULL, PGC_SU_BACKEND, 0, NULL, NULL, NULL);
+
+  DefineCustomStringVariable(
+      "pg_net.allowed_cidrs",
+      "comma-separated CIDRs that are always allowed, taking precedence over pg_net.blocked_cidrs",
+      "destination IPs (after DNS resolution and on every redirect hop) matching any entry are "
+      "allowed even if they also match pg_net.blocked_cidrs",
+      &guc_allowed_cidrs, "", PGC_SIGHUP, 0, pg_net_check_allowed_cidrs,
+      pg_net_assign_allowed_cidrs, NULL);
+
+  DefineCustomStringVariable(
+      "pg_net.blocked_cidrs",
+      "comma-separated CIDRs that requests are forbidden from connecting to",
+      "destination IPs (after DNS resolution and on every redirect hop) matching any entry are "
+      "rejected before any data is sent, unless they also match pg_net.allowed_cidrs; useful to "
+      "block loopback (127.0.0.0/8, ::1/128), link-local/cloud-metadata (169.254.0.0/16) and "
+      "private ranges",
+      &guc_blocked_cidrs, "", PGC_SIGHUP, 0, pg_net_check_blocked_cidrs,
+      pg_net_assign_blocked_cidrs, NULL);
 }

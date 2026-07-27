@@ -1,6 +1,8 @@
 #ifndef CORE_H
 #define CORE_H
 
+#include "ip_filter.h"
+
 typedef enum {
   WS_NOT_YET = 1,
   WS_RUNNING,
@@ -39,6 +41,8 @@ typedef struct {
   char              *req_body;
   char              *method;
   CURL              *ez_handle;
+  char               block_reason[PG_NET_BLOCK_REASON_LEN]; // set by the prereq callback when a
+                                                            // request is aborted by IP filtering
 } CurlHandle;
 
 uint64 delete_expired_responses(char *ttl, int batch_size);

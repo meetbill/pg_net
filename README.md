@@ -137,6 +137,8 @@ The extension creates the following configurable variables:
 2. **pg_net.ttl** _(default: 6 hours)_: An interval that defines the max time a row in the _`net.http_response`_ will live before being deleted. Note that this won't happen exactly after the TTL has passed. The worker will perform this deletion while its processing requests.
 3. **pg_net.database_name** _(default: 'postgres')_: A string that defines which database the extension is applied to
 4. **pg_net.username** _(default: NULL)_: A string that defines which user will the background worker be connected with. If not set (`NULL`), it will assume the bootstrap user.
+5. **pg_net.blocked_cidrs** _(default: '')_: A comma-separated list of CIDRs that requests are forbidden from connecting to. The check runs after DNS resolution and on every redirect hop, so it cannot be bypassed by DNS rebinding or `3xx` redirects to internal addresses. Blocked requests fail with `error_msg` `blocked by pg_net.blocked_cidrs: destination <ip>`.
+6. **pg_net.allowed_cidrs** _(default: '')_: A comma-separated list of CIDRs that are always allowed, taking precedence over `pg_net.blocked_cidrs`. Useful when you want to block an entire range but keep a specific host reachable.
 
 All these variables can be viewed with the following commands:
 ```sql
@@ -144,6 +146,8 @@ show pg_net.batch_size;
 show pg_net.ttl;
 show pg_net.database_name;
 show pg_net.username;
+show pg_net.blocked_cidrs;
+show pg_net.allowed_cidrs;
 ```
 
 You can change these by editing the `postgresql.conf` file (find it with `SHOW config_file;`) or with `ALTER SYSTEM`:
@@ -174,6 +178,86 @@ grant alter system on parameter pg_net.batch_size to <role>;
 ```
 
 To allow regular users to update `pg_net` settings.
+
+## Restricting request destinations (SSRF protection)
+
+Any role that can call `net.http_*()` can make the background worker send requests to arbitrary
+addresses. In shared or cloud environments this is an SSRF surface: the worker could be pointed at
+loopback (`127.0.0.1`), the cloud metadata endpoint (`169.254.169.254`), or internal ranges.
+
+`pg_net.blocked_cidrs` and `pg_net.allowed_cidrs` let you constrain where requests may connect. The
+check is enforced inside libcurl's pre-connect callback, which runs **after DNS resolution and on
+every redirect hop** — so it also stops `3xx` redirects and DNS rebinding that point at an otherwise
+forbidden IP.
+
+Matching order per connection attempt:
+
+1. If the destination IP matches `pg_net.allowed_cidrs` → **allowed** (blocklist is not consulted).
+2. Otherwise, if it matches `pg_net.blocked_cidrs` → **blocked**.
+3. Otherwise → **allowed** (both lists empty is the default and preserves prior behaviour).
+
+Both lists accept comma-separated IPv4/IPv6 CIDRs (a bare IP means `/32` or `/128`). IPv4-mapped
+IPv6 (`::ffff:a.b.c.d`) is normalized to IPv4 before matching.
+
+Block loopback, link-local and cloud metadata (a good baseline):
+
+```sql
+alter system set pg_net.blocked_cidrs to '127.0.0.0/8,::1/128,169.254.0.0/16,fe80::/10';
+select pg_reload_conf();
+```
+
+Block all private ranges too, but keep one internal API reachable:
+
+```sql
+alter system set pg_net.blocked_cidrs to '127.0.0.0/8,::1/128,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16';
+alter system set pg_net.allowed_cidrs to '10.0.5.100/32';
+select pg_reload_conf();
+```
+
+A request blocked by this filter appears in `net._http_response` with a `null` `status_code` and an
+`error_msg` of `blocked by pg_net.blocked_cidrs: destination <ip>`.
+
+> [!NOTE]
+> This filter applies to the loopback interface too, which a network firewall or cloud security
+> group cannot: loopback traffic never leaves the host's network stack. If your threat model
+> includes blocking access to services on `127.0.0.1` inside the same container, this in-process
+> check is the only layer that can enforce it.
+
+### What it protects against
+
+The check runs on **every TCP connection libcurl opens**, including each redirect hop, so all of the
+following point at the destination that is actually being contacted (not what the user typed):
+
+- Direct connects — the IP libcurl resolved from the URL is checked.
+- `3xx` redirects to an internal address — a `Location:` header pointing at `127.0.0.1`,
+  `169.254.169.254`, or any other blocked range triggers a fresh connection, which fires the callback
+  again and is aborted.
+- DNS rebinding — the IP checked is the one from the *current* resolution, not the hostname the user
+  supplied; a domain that flips its A record between requests is caught on each new connection.
+- Same-host redirects that reuse an existing connection are still safe: the peer IP hasn't changed,
+  so the previously-approved decision still holds.
+
+### Limitation: HTTP proxies
+
+The filter inspects the IP of the TCP peer libcurl connects to. When the worker is configured to
+use an HTTP/HTTPS/SOCKS proxy — including via environment variables the postmaster inherits
+(`http_proxy`, `https_proxy`, `all_proxy`) — that peer is the **proxy**, not the ultimate destination.
+The real target hostname is either resolved by the proxy (HTTPS via `CONNECT`) or never resolved at
+all on this side (HTTP forward proxy), so `pg_net.blocked_cidrs` cannot inspect it.
+
+To check whether the worker has proxy environment variables in scope:
+
+```sql
+select pid from pg_stat_activity where backend_type ilike '%pg_net%';
+```
+
+```bash
+cat /proc/<pid>/environ | tr '\0' '\n' | grep -i proxy
+```
+
+If any `*_proxy` variable is set, treat the IP filter as best-effort only and enforce destination
+restrictions at the proxy itself. If no proxy is configured (the common case for direct-egress
+deployments), the filter is authoritative.
 
 # Requests API
 

@@ -10,6 +10,7 @@
 #include "core.h"
 #include "errors.h"
 #include "event.h"
+#include "ip_filter.h"
 
 static SPIPlanPtr del_response_plan     = NULL;
 static SPIPlanPtr del_return_queue_plan = NULL;
@@ -48,6 +49,7 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   handle->id        = row.id;
   handle->body      = makeStringInfo();
   handle->ez_handle = curl_easy_init();
+  handle->block_reason[0] = '\0';
 
   handle->timeout_milliseconds = row.timeout_milliseconds;
 
@@ -104,6 +106,12 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_TIMEOUT_MS, (long)handle->timeout_milliseconds);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PRIVATE, handle);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_FOLLOWLOCATION, (long)true);
+  // Register a pre-connect hook to enforce pg_net.allowed_cidrs /
+  // pg_net.blocked_cidrs. This fires after DNS + TCP but before any request
+  // bytes are sent, and it runs again on each redirect hop, so it cannot be
+  // bypassed by a 302 or DNS rebinding trick.
+  EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PREREQFUNCTION, pg_net_prereq_cb);
+  EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PREREQDATA, handle);
   if (LOG_MIN_MESSAGES <= DEBUG2) EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_VERBOSE, 1L);
 #if LIBCURL_VERSION_NUM >= 0x075500 /* libcurl 7.85.0 */
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PROTOCOLS_STR, "http,https");
@@ -280,6 +288,11 @@ void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
           detailed_timeout_strerror(handle->ez_handle, handle->timeout_milliseconds);
 
       vals[6]  = CStringGetTextDatum(timeout_msg.msg);
+      nulls[6] = ' ';
+    } else if (curl_return_code == CURLE_ABORTED_BY_CALLBACK && handle->block_reason[0] != '\0') {
+      // Our IP filter aborted the request; surface the specific reason rather
+      // than curl's generic "aborted by callback" message.
+      vals[6]  = CStringGetTextDatum(handle->block_reason);
       nulls[6] = ' ';
     } else {
       const char *error_msg = curl_easy_strerror(curl_return_code);
