@@ -5,28 +5,83 @@ pg_net is OSS. PR and issues are welcome.
 
 ## Development
 
-[Nix](https://nixos.org/download.html) is required to set up the environment and [Cachix](https://docs.cachix.org/installation) for cache usage.
+Nix with flakes is required.
 
+### Set up Nix
+
+First, [Install Nix](https://nixos.org/download.html).
+
+#### Enable flakes
+
+Edit `/etc/nix/nix.conf`, add:
+
+```nix.conf
+experimental-features = nix-command flakes
+```
+
+and restart the daemon, on macOS:
+
+```
+sudo launchctl kickstart -k system/org.nixos.nix-daemon
+```
+
+#### Use binary cache
+
+If you are a repo member, you can skip building for hours and download packages instead by configuring the `nxpg` binary cache.
+
+1. Go to https://app.cachix.org, log in with Github and create a **personal auth token**.
+
+2. Use auth token:
+  ```sh
+  nix run nixpkgs#cachix authtoken <token>
+  ```
+
+3. Use the cache:
+  ```sh
+  nix run nixpkgs#cachix use nxpg
+  ```
+
+> [!CAUTION]
+> DO NOT use `trusted-users` in `/etc/nix/nix.conf` as it [grants root without password](https://nix.dev/manual/nix/stable/command-ref/conf-file.html#conf-trusted-users). Instead, add the binary cache to `extra-substituters` and `extra-trusted-public-keys`.
 
 ### Testing
 
 For testing locally, execute:
 
 ```bash
-# This will download all the dependencies from the cache (when prompted for trusting the nxpg cache answer yes)
+# Open a development shell with all deps and tools present
 $ nix develop
 
 # test on latest pg
 $ xpg test
 
-# test on pg 12
-$ xpg -v 12 test
+# test on pg 14
+$ xpg -v 14 test
 
-# test on pg 13
-$ xpg -v 13 test
+# test on pg 15
+$ xpg -v 15 test
 ```
 
 This will spawn a local db and an nginx server for testing.
+
+To run a single test , set `PYTEST_ARGS` to `-k test_function_name`. For example:
+
+```bash
+$ nix develop
+$ PYTEST_ARGS="-k test_connect" xpg test
+```
+
+Will run the `test_connect` test only. `PYTEST_ARGS` is passed through to pytest, so you can pass other arguments to pytest as well. in fact you can pass any args via `PYTEST_ARGS`. You can e.g. run all tests in a file:
+
+```bash
+$ nix develop
+$ PYTEST_ARGS="PYTEST_ARGS="test/test_user_db.py" xpg test
+```
+
+Will run tests in `test/test_user_db.py`, or:
+
+### Writing new tests
+Currently the test suite uses SQLAlchemy for many tests. We are moving away from SQLAlchemy and towards using psycopg directly. Please do not write any new tests using SQLAlchemy.
 
 ### Debugging
 

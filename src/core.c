@@ -23,7 +23,21 @@ static size_t body_cb(void *contents, size_t size, size_t nmemb, void *userp) {
   return realsize;
 }
 
-static struct curl_slist *pg_text_array_to_slist(ArrayType *array, struct curl_slist *headers) {
+// A header with a CR or LF in it can inject extra headers or a body into the request, since libcurl
+// ends every header with CRLF. Such requests are not sent. The message only names the header, the
+// value may hold credentials.
+static char *crlf_header_rejection(const char *hdr) {
+  size_t bad = strcspn(hdr, "\r\n");
+  if (hdr[bad] == '\0') return NULL;
+
+  size_t name_len = strcspn(hdr, ":");
+  if (name_len > bad) name_len = bad;
+
+  return psprintf("header \"%.*s\" contains a carriage return or line feed", (int)name_len, hdr);
+}
+
+static struct curl_slist *pg_text_array_to_slist(ArrayType *array, struct curl_slist *headers,
+                                                 char **rejected_reason) {
   ArrayIterator iterator;
   Datum         value;
   bool          isnull;
@@ -37,7 +51,17 @@ static struct curl_slist *pg_text_array_to_slist(ArrayType *array, struct curl_s
     }
 
     hdr = TextDatumGetCString(value);
-    EREPORT_CURL_SLIST_APPEND(headers, hdr);
+
+    char *reason = crlf_header_rejection(hdr);
+    if (reason) {
+      if (*rejected_reason == NULL)
+        *rejected_reason = reason;
+      else
+        pfree(reason);
+    } else {
+      EREPORT_CURL_SLIST_APPEND(headers, hdr);
+    }
+
     pfree(hdr);
   }
   array_free_iterator(iterator);
@@ -45,21 +69,31 @@ static struct curl_slist *pg_text_array_to_slist(ArrayType *array, struct curl_s
   return headers;
 }
 
+int guc_max_timeout_ms = DEFAULT_MAX_TIMEOUT_MS;
+
 void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   handle->id        = row.id;
   handle->body      = makeStringInfo();
   handle->ez_handle = curl_easy_init();
   handle->block_reason[0] = '\0';
 
+  // libcurl treats a 0 timeout as no timeout, and a request that never finishes blocks the batch
+  // loop forever. Requests outside the bound are not sent, they get an error response instead. The
+  // handle is still fully set up so it can be cleaned up like the others.
   handle->timeout_milliseconds = row.timeout_milliseconds;
+  handle->rejected_reason      = NULL;
+  if (handle->timeout_milliseconds <= 0 || handle->timeout_milliseconds > guc_max_timeout_ms) {
+    handle->rejected_reason =
+        psprintf("timeout_milliseconds must be between 1 and %d (pg_net.max_timeout_ms), got %d",
+                 guc_max_timeout_ms, row.timeout_milliseconds);
+    handle->timeout_milliseconds = guc_max_timeout_ms;
+  }
 
   if (!row.headersBin.isnull) {
     ArrayType         *pgHeaders       = DatumGetArrayTypeP(row.headersBin.value);
     struct curl_slist *request_headers = NULL;
 
-    request_headers = pg_text_array_to_slist(pgHeaders, request_headers);
-
-    EREPORT_CURL_SLIST_APPEND(request_headers, "User-Agent: pg_net/" EXTVERSION);
+    request_headers = pg_text_array_to_slist(pgHeaders, request_headers, &handle->rejected_reason);
 
     handle->request_headers = request_headers;
   }
@@ -103,6 +137,8 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_HEADER, 0L);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_URL, handle->url);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_HTTPHEADER, handle->request_headers);
+  // libcurl leaves this out when the request headers have their own User-Agent
+  EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_USERAGENT, "pg_net/" EXTVERSION);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_TIMEOUT_MS, (long)handle->timeout_milliseconds);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PRIVATE, handle);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_FOLLOWLOCATION, (long)true);
@@ -120,16 +156,35 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
 #endif
 }
 
-void set_curl_mhandle(WorkerState *wstate) {
-  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_SOCKETFUNCTION, multi_socket_cb);
-  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_SOCKETDATA, wstate);
-  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_TIMERFUNCTION, multi_timer_cb);
-  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_TIMERDATA, wstate);
+void set_curl_mhandle(CURLM *curl_mhandle) {
+  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_SOCKETFUNCTION, multi_socket_cb);
+  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_SOCKETDATA, curl_mhandle);
+  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_TIMERFUNCTION, multi_timer_cb);
+}
+
+/*
+ * Prepares and saves a plan for the given sql source and returns the
+ * saved plan
+ */
+static SPIPlanPtr prepare_and_save_plan(const char *sql, int nargs, Oid *argtypes) {
+  SPIPlanPtr prepared = SPI_prepare(sql, nargs, argtypes);
+  if (prepared == NULL)
+    ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
+
+  SPIPlanPtr saved = SPI_saveplan(prepared);
+  if (saved == NULL)
+    ereport(ERROR, errmsg("SPI_saveplan failed: %s", SPI_result_code_string(SPI_result)));
+
+  int ret_code = SPI_freeplan(prepared);
+  if (ret_code != 0)
+    ereport(ERROR, errmsg("SPI_freeplan error: %s", SPI_result_code_string(ret_code)));
+
+  return saved;
 }
 
 uint64 delete_expired_responses(char *ttl, int batch_size) {
   if (del_response_plan == NULL) {
-    SPIPlanPtr tmp = SPI_prepare("\
+    del_response_plan = prepare_and_save_plan("\
         WITH\
         rows AS (\
           SELECT ctid\
@@ -140,12 +195,7 @@ uint64 delete_expired_responses(char *ttl, int batch_size) {
         )\
         DELETE FROM net._http_response r\
         USING rows WHERE r.ctid = rows.ctid",
-                                 2, (Oid[]){INTERVALOID, INT4OID});
-    if (tmp == NULL)
-      ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
-
-    del_response_plan = SPI_saveplan(tmp);
-    if (del_response_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
+                                              2, (Oid[]){INTERVALOID, INT4OID});
   }
 
   int ret_code = SPI_execute_plan(
@@ -167,7 +217,7 @@ uint64 delete_expired_responses(char *ttl, int batch_size) {
 
 uint64 consume_request_queue(const int batch_size) {
   if (del_return_queue_plan == NULL) {
-    SPIPlanPtr tmp = SPI_prepare("\
+    del_return_queue_plan = prepare_and_save_plan("\
         WITH\
         rows AS (\
           SELECT id\
@@ -178,13 +228,7 @@ uint64 consume_request_queue(const int batch_size) {
         DELETE FROM net.http_request_queue q\
         USING rows WHERE q.id = rows.id\
         RETURNING q.id, q.method, q.url, timeout_milliseconds, array(select key || ': ' || value from jsonb_each_text(q.headers)), q.body",
-                                 1, (Oid[]){INT4OID});
-
-    if (tmp == NULL)
-      ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
-
-    del_return_queue_plan = SPI_saveplan(tmp);
-    if (del_return_queue_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
+                                                  1, (Oid[]){INT4OID});
   }
 
   int ret_code =
@@ -229,7 +273,7 @@ static Jsonb *jsonb_headers_from_curl_handle(CURL *ez_handle) {
   PG_JSONB_INIT_STATE(headers);
   (void)PG_JSONB_PUSH(headers, WJB_BEGIN_OBJECT, NULL);
 
-  while ((header = curl_easy_nextheader(ez_handle, CURLH_HEADER, 0, prev))) {
+  while ((header = curl_easy_nextheader(ez_handle, CURLH_HEADER, -1, prev))) {
     JsonbValue key   = {.type = jbvString,
                         .val  = {.string = {.val = header->name, .len = strlen(header->name)}}};
     JsonbValue value = {.type = jbvString,
@@ -242,8 +286,41 @@ static Jsonb *jsonb_headers_from_curl_handle(CURL *ez_handle) {
   return PG_JSONB_OBJECT_FINISH(headers);
 }
 
+enum { response_nparams = 7 }; // using an enum because const size_t doesn't compile
+
+static void execute_insert_response(Datum *vals, char *nulls) {
+  if (ins_response_plan == NULL) {
+    ins_response_plan = prepare_and_save_plan(
+        "\
+        insert into net._http_response(id, status_code, content, headers, content_type, timed_out, error_msg) values ($1, $2, $3, $4, $5, $6, $7)",
+        response_nparams,
+        (Oid[response_nparams]){INT8OID, INT4OID, TEXTOID, JSONBOID, TEXTOID, BOOLOID, TEXTOID});
+  }
+
+  int ret_code = SPI_execute_plan(ins_response_plan, vals, nulls, false, 0);
+
+  if (ret_code != SPI_OK_INSERT) {
+    ereport(ERROR, errmsg("Error when inserting response: %s", SPI_result_code_string(ret_code)));
+  }
+}
+
+void insert_rejected_response(CurlHandle *handle) {
+  Datum vals[response_nparams];
+  char  nulls[response_nparams];
+  MemSet(nulls, 'n', response_nparams);
+
+  vals[0]  = Int64GetDatum(handle->id);
+  nulls[0] = ' ';
+  vals[5]  = BoolGetDatum(false);
+  nulls[5] = ' ';
+  vals[6]  = CStringGetTextDatum(handle->rejected_reason);
+  nulls[6] = ' ';
+
+  execute_insert_response(vals, nulls);
+}
+
 void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
-  enum { nparams = 7 }; // using an enum because const size_t nparams doesn't compile
+  enum { nparams = response_nparams };
   Datum vals[nparams];
   char  nulls[nparams];
   MemSet(nulls, 'n', nparams);
@@ -304,32 +381,14 @@ void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
     }
   }
 
-  if (ins_response_plan == NULL) {
-    SPIPlanPtr tmp = SPI_prepare(
-        "\
-        insert into net._http_response(id, status_code, content, headers, content_type, timed_out, error_msg) values ($1, $2, $3, $4, $5, $6, $7)",
-        nparams, (Oid[nparams]){INT8OID, INT4OID, TEXTOID, JSONBOID, TEXTOID, BOOLOID, TEXTOID});
-
-    if (tmp == NULL)
-      ereport(ERROR, errmsg("SPI_prepare failed: %s", SPI_result_code_string(SPI_result)));
-
-    ins_response_plan = SPI_saveplan(tmp);
-    if (ins_response_plan == NULL) ereport(ERROR, errmsg("SPI_saveplan failed"));
-
-    SPI_freeplan(tmp);
-  }
-
-  int ret_code = SPI_execute_plan(ins_response_plan, vals, nulls, false, 0);
-
-  if (ret_code != SPI_OK_INSERT) {
-    ereport(ERROR, errmsg("Error when inserting response: %s", SPI_result_code_string(ret_code)));
-  }
+  execute_insert_response(vals, nulls);
 }
 
 void pfree_handle(CurlHandle *handle) {
   pfree(handle->url);
   pfree(handle->method);
   if (handle->req_body) pfree(handle->req_body);
+  if (handle->rejected_reason) pfree(handle->rejected_reason);
 
   if (handle->body) destroyStringInfo(handle->body);
 

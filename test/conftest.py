@@ -2,36 +2,60 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import psycopg
+
+from common import PSYCOPG_CONNSTR
+
 
 @pytest.fixture(scope="function")
 def engine():
-    engine = create_engine("postgresql:///postgres")
+    engine = create_engine(PSYCOPG_CONNSTR)
     yield engine
     engine.dispose()
 
 
 @pytest.fixture(scope="function")
-def sess(engine):
+def conn():
+    """Direct connection via psycopg"""
 
+    conn = psycopg.connect("dbname=postgres")
+
+    conn.execute("create extension if not exists pg_net;")
+    conn.commit()
+
+    yield conn
+
+    conn.rollback()
+
+    conn.execute("drop extension if exists pg_net cascade;")
+    conn.commit()
+
+
+@pytest.fixture(scope="function")
+def sess(engine):
     session = Session(engine)
 
     # Reset sequences and tables between tests
-    session.execute(text(
-        """
+    session.execute(
+        text(
+            """
     create extension if not exists pg_net;
     """
-    ))
+        )
+    )
     session.commit()
 
     yield session
 
     session.rollback()
 
-    session.execute(text(
-        """
+    session.execute(
+        text(
+            """
     drop extension if exists pg_net cascade;
     """
-    ))
+        )
+    )
     session.commit()
 
 

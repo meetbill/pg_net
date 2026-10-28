@@ -18,16 +18,16 @@
     },
     "nixpkgs_2": {
       "locked": {
-        "lastModified": 1764521362,
-        "narHash": "sha256-M101xMtWdF1eSD0xhiR8nG8CXRlHmv6V+VoY65Smwf4=",
+        "lastModified": 1780145889,
+        "narHash": "sha256-md0zn0RnwNvPyASas1yG5YUuwQ4ALA6ucL50l0DvqCo=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "871b9fd269ff6246794583ce4ee1031e1da71895",
+        "rev": "8c50a710ddca43d7a530fb805ad55bde8d0141c5",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "25.11",
+        "ref": "26.05",
         "repo": "nixpkgs",
         "type": "github"
       }
@@ -43,16 +43,16 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1782266378,
-        "narHash": "sha256-moRjdGvymGEyREU4++qpNzDuUN+nVC69CUYjhuY4Yzs=",
-        "owner": "steve-chavez",
+        "lastModified": 1791394750,
+        "narHash": "sha256-SMv4EKUaGmfUyXyeGHW3AiX1vbef7El56RKTIxio8jQ=",
+        "owner": "supabase",
         "repo": "xpg",
-        "rev": "d81725666a193c644fe0db96a988ece66edf460c",
+        "rev": "8f2a2005e8e020e0db5a7cbb94a87a9dd3227411",
         "type": "github"
       },
       "original": {
-        "owner": "steve-chavez",
-        "ref": "v2.4.0",
+        "owner": "supabase",
+        "ref": "v2.6.0",
         "repo": "xpg",
         "type": "github"
       }

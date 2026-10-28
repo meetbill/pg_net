@@ -1,9 +1,9 @@
 # PG_NET
 *A PostgreSQL extension that enables asynchronous (non-blocking) HTTP/HTTPS requests with SQL*.
 
-Requires libcurl >= 7.83. Compatible with PostgreSQL > = 12.
+Requires libcurl >= 7.83. Compatible with PostgreSQL > = 14.
 
-![PostgreSQL version](https://img.shields.io/badge/postgresql-12+-blue.svg)
+![PostgreSQL version](https://img.shields.io/badge/postgresql-14+-blue.svg)
 [![License](https://img.shields.io/pypi/l/markdown-subtemplate.svg)](https://github.com/supabase/pg_net/blob/master/LICENSE)
 [![Coverage Status](https://coveralls.io/repos/github/supabase/pg_net/badge.svg)](https://coveralls.io/github/supabase/pg_net)
 [![Tests](https://github.com/supabase/pg_net/actions/workflows/main.yml/badge.svg)](https://github.com/supabase/pg_net/actions)
@@ -90,9 +90,11 @@ When any of the three request functions (`http_get`, `http_post`, `http_delete`)
 
 Once a response is received, it gets stored in the `_http_response` table. By monitoring this table, you can keep track of response statuses and messages.
 
+A request whose headers contain a carriage return or line feed is not sent. It gets an `ERROR` response naming the header, since libcurl terminates headers with CRLF and an embedded one would let the header smuggle extra headers or a body into the request.
+
 > [!IMPORTANT]
-> Inserting directly into the `net.http_request_queue` won't cause the worker to process requests, you must use the request functions.
-> We do it this way to avoid polling the `net.http_request_queue` table, which would pollute `pg_stat_statements` and cause unnecesssary activity from the worker.
+> Inserting directly into `net.http_request_queue` won't wake the worker, you must use the request functions. Rows inserted directly are only processed the next time the worker wakes up.
+> We do it this way to avoid polling the `net.http_request_queue` table, which would pollute `pg_stat_statements` and cause unnecessary activity from the worker.
 
 The extension employs C's [libcurl](https://curl.se/libcurl/c/) library within a PostgreSQL [background worker](https://www.postgresql.org/docs/current/bgworker.html) to manage HTTP requests.
 This background worker sleeps until it receives a signal from the request functions, which awakes it and prompts it to read the `net.http_request_queue` table and execute the requests on it.
@@ -134,11 +136,12 @@ create extension pg_net;
 The extension creates the following configurable variables:
 
 1. **pg_net.batch_size** _(default: 200)_: An integer that limits the max number of rows that the extension will process from _`net.http_request_queue`_ during each read
-2. **pg_net.ttl** _(default: 6 hours)_: An interval that defines the max time a row in the _`net.http_response`_ will live before being deleted. Note that this won't happen exactly after the TTL has passed. The worker will perform this deletion while its processing requests.
+2. **pg_net.ttl** _(default: 6 hours)_: An interval that defines the max time a row in the _`net.http_response`_ will live before being deleted. Any interval that PostgreSQL accepts can be used (e.g. `'1 minute 10 seconds'`); invalid or negative values are rejected when the setting is changed. Note that the deletion won't happen exactly after the TTL has passed. The worker will perform this deletion while its processing requests.
 3. **pg_net.database_name** _(default: 'postgres')_: A string that defines which database the extension is applied to
 4. **pg_net.username** _(default: NULL)_: A string that defines which user will the background worker be connected with. If not set (`NULL`), it will assume the bootstrap user.
-5. **pg_net.blocked_cidrs** _(default: '')_: A comma-separated list of CIDRs that requests are forbidden from connecting to. The check runs after DNS resolution and on every redirect hop, so it cannot be bypassed by DNS rebinding or `3xx` redirects to internal addresses. Blocked requests fail with `error_msg` `blocked by pg_net.blocked_cidrs: destination <ip>`.
-6. **pg_net.allowed_cidrs** _(default: '')_: A comma-separated list of CIDRs that are always allowed, taking precedence over `pg_net.blocked_cidrs`. Useful when you want to block an entire range but keep a specific host reachable.
+5. **pg_net.max_timeout_ms** _(default: 600000)_: An integer that bounds the `timeout_milliseconds` of a request. A request with a timeout outside `1..pg_net.max_timeout_ms` is not sent and gets an `ERROR` response saying so, so every request has a finite lifetime and a single request can't block the others. Only superusers can change it.
+6. **pg_net.blocked_cidrs** _(default: '')_: A comma-separated list of CIDRs that requests are forbidden from connecting to. The check runs after DNS resolution and on every redirect hop, so it cannot be bypassed by DNS rebinding or `3xx` redirects to internal addresses. Blocked requests fail with `error_msg` `blocked by pg_net.blocked_cidrs: destination <ip>`.
+7. **pg_net.allowed_cidrs** _(default: '')_: A comma-separated list of CIDRs that are always allowed, taking precedence over `pg_net.blocked_cidrs`. Useful when you want to block an entire range but keep a specific host reachable.
 
 All these variables can be viewed with the following commands:
 ```sql
@@ -146,6 +149,7 @@ show pg_net.batch_size;
 show pg_net.ttl;
 show pg_net.database_name;
 show pg_net.username;
+show pg_net.max_timeout_ms;
 show pg_net.blocked_cidrs;
 show pg_net.allowed_cidrs;
 ```
@@ -274,7 +278,7 @@ net.http_get(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 5000
 )
     -- request_id reference
     returns bigint
@@ -337,7 +341,7 @@ net.http_post(
     -- key/values to be included in request headers
     headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 5000
 )
     -- request_id reference
     returns bigint
@@ -412,7 +416,9 @@ net.http_delete(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 2000
+    timeout_milliseconds int default 5000,
+    -- body of the DELETE request
+    body jsonb default null
 )
     -- request_id reference
     returns bigint

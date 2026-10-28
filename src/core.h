@@ -3,21 +3,26 @@
 
 #include "ip_filter.h"
 
+#define DEFAULT_MAX_TIMEOUT_MS 600000
+
+// pg_net.max_timeout_ms
+extern int guc_max_timeout_ms;
+
 typedef enum {
   WS_NOT_YET = 1,
   WS_RUNNING,
   WS_EXITED,
 } WorkerStatus;
 
-// the state of the background worker
+// The state of the background worker stored in shared memory.
+// It is used to communicate between the background worker process
+// and other backends.
 typedef struct {
-  pg_atomic_uint32  got_restart;
-  pg_atomic_uint32  should_wake;
-  pg_atomic_uint32  status;
-  Latch            *shared_latch;
+  pg_atomic_uint32 got_restart;
+  pg_atomic_uint32 should_wake;
+  pg_atomic_uint32 status;
+  Latch *volatile shared_latch;
   ConditionVariable cv; // required to publish the state of the worker to other backends
-  int               epfd;
-  CURLM            *curl_mhandle;
 } WorkerState;
 
 // A row coming from the http_request_queue
@@ -43,6 +48,7 @@ typedef struct {
   CURL              *ez_handle;
   char               block_reason[PG_NET_BLOCK_REASON_LEN]; // set by the prereq callback when a
                                                             // request is aborted by IP filtering
+  char              *rejected_reason; // set when the request must not be sent
 } CurlHandle;
 
 uint64 delete_expired_responses(char *ttl, int batch_size);
@@ -51,9 +57,10 @@ uint64 consume_request_queue(const int batch_size);
 
 RequestQueueRow get_request_queue_row(HeapTuple spi_tupval, TupleDesc spi_tupdesc);
 
-void set_curl_mhandle(WorkerState *wstate);
+void set_curl_mhandle(CURLM *curl_mhandle);
 
 void insert_response(CurlHandle *handle, CURLcode curl_return_code);
+void insert_rejected_response(CurlHandle *handle);
 
 void init_curl_handle(CurlHandle *handle, RequestQueueRow row);
 
