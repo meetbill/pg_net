@@ -46,8 +46,11 @@ typedef struct {
   char              *req_body;
   char              *method;
   CURL              *ez_handle;
-  char               block_reason[PG_NET_BLOCK_REASON_LEN]; // set by the prereq callback when a
-                                                            // request is aborted by IP filtering
+  bool               ip_blocked;           // a destination was rejected by the IP filter
+  bool               ip_socket_created;    // an allowed destination got a socket, so a connection
+                                           // was attempted
+  char               block_reason[PG_NET_BLOCK_REASON_LEN]; // set by the IP filter callbacks when
+                                                            // a destination is rejected
   char              *rejected_reason; // set when the request must not be sent
 } CurlHandle;
 

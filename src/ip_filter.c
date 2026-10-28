@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #include "pg_prelude.h"
 
@@ -206,13 +208,99 @@ static bool match_cidr_list(const CidrList *list, int family, const uint8_t addr
   return false;
 }
 
+// Extract a printable, normalized destination address from the sockaddr that
+// libcurl is about to connect to. Returns false for address families that are
+// not IP (and therefore cannot be matched against the CIDR lists).
+static bool sockaddr_to_ip(const struct curl_sockaddr *address, char *ip, size_t ip_len,
+                           int *family, uint8_t addr[16]) {
+  if (!address) return false;
+
+  memset(addr, 0, 16);
+
+  if (address->family == AF_INET) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)&address->addr;
+    *family                       = AF_INET;
+    memcpy(addr, &sin->sin_addr, 4);
+    return inet_ntop(AF_INET, addr, ip, (socklen_t)ip_len) != NULL;
+  }
+
+  if (address->family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)&address->addr;
+    int                        ip_family;
+
+    if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+      // Normalize so a v4-mapped destination matches IPv4 CIDRs and is
+      // reported in the same form the operator wrote.
+      *family   = AF_INET;
+      ip_family = AF_INET;
+      memcpy(addr, &sin6->sin6_addr.s6_addr[12], 4);
+    } else {
+      *family   = AF_INET6;
+      ip_family = AF_INET6;
+      memcpy(addr, &sin6->sin6_addr, 16);
+    }
+    return inet_ntop(ip_family, addr, ip, (socklen_t)ip_len) != NULL;
+  }
+
+  return false;
+}
+
+// Primary filter: runs before a socket is created for each connection attempt,
+// including each redirect hop. Returning CURL_SOCKET_BAD makes libcurl fail the
+// connection with CURLE_COULDNT_CONNECT without ever connecting to the address.
+curl_socket_t pg_net_opensocket_cb(void *clientp, __attribute__((unused)) curlsocktype purpose,
+                                   struct curl_sockaddr *address) {
+  CurlHandle *handle = (CurlHandle *)clientp;
+  int         family;
+  uint8_t     addr[16] = {0};
+  char        ip[INET6_ADDRSTRLEN];
+
+  bool have_rules = (allowed_list.count > 0) || (blocked_list.count > 0);
+
+  if (have_rules) {
+    if (!sockaddr_to_ip(address, ip, sizeof(ip), &family, addr)) {
+      // Fail closed only when rules exist, otherwise preserve the pre-filter
+      // default of "allow everything".
+      if (handle) {
+        handle->ip_blocked = true;
+        snprintf(handle->block_reason, PG_NET_BLOCK_REASON_LEN,
+                 PG_NET_ERR_IP_UNPARSEABLE ": could not determine destination IP");
+      }
+      elog(WARNING, "pg_net: aborting connection with an unparseable destination");
+      return CURL_SOCKET_BAD;
+    }
+
+    // Allowlist wins.
+    if (match_cidr_list(&allowed_list, family, addr)) {
+      elog(DEBUG1, "pg_net: %s allowed by pg_net.allowed_cidrs", ip);
+    } else if (match_cidr_list(&blocked_list, family, addr)) {
+      if (handle) {
+        handle->ip_blocked = true;
+        snprintf(handle->block_reason, PG_NET_BLOCK_REASON_LEN,
+                 PG_NET_ERR_IP_BLOCKED ": destination %s matched pg_net.blocked_cidrs", ip);
+      }
+      elog(WARNING,
+           "pg_net: aborting request to %s (matched pg_net.blocked_cidrs), "
+           "no connection attempted",
+           ip);
+      return CURL_SOCKET_BAD;
+    }
+  }
+
+  // Allowed: create the socket ourselves, since this callback replaces
+  // libcurl's internal socket() call.
+  curl_socket_t sockfd = socket(address->family, address->socktype, address->protocol);
+  if (sockfd != CURL_SOCKET_BAD && handle) handle->ip_socket_created = true;
+  return sockfd;
+}
+
 int pg_net_prereq_cb(void *clientp, char *conn_primary_ip,
                      __attribute__((unused)) char *conn_local_ip,
                      __attribute__((unused)) int   conn_primary_port,
                      __attribute__((unused)) int   conn_local_port) {
   CurlHandle *handle = (CurlHandle *)clientp;
   int         family;
-  uint8_t     addr[16];
+  uint8_t     addr[16] = {0};
 
   bool have_rules = (allowed_list.count > 0) || (blocked_list.count > 0);
 
@@ -221,8 +309,9 @@ int pg_net_prereq_cb(void *clientp, char *conn_primary_ip,
     // default of "allow everything".
     if (have_rules) {
       if (handle) {
+        handle->ip_blocked = true;
         snprintf(handle->block_reason, PG_NET_BLOCK_REASON_LEN,
-                 "blocked by pg_net: could not parse destination IP");
+                 PG_NET_ERR_IP_UNPARSEABLE ": could not determine destination IP");
       }
       return CURL_PREREQFUNC_ABORT;
     }
@@ -238,8 +327,10 @@ int pg_net_prereq_cb(void *clientp, char *conn_primary_ip,
   // Blocklist next.
   if (match_cidr_list(&blocked_list, family, addr)) {
     if (handle) {
+      handle->ip_blocked = true;
       snprintf(handle->block_reason, PG_NET_BLOCK_REASON_LEN,
-               "blocked by pg_net.blocked_cidrs: destination %s", conn_primary_ip);
+               PG_NET_ERR_IP_BLOCKED ": destination %s matched pg_net.blocked_cidrs",
+               conn_primary_ip);
     }
     elog(WARNING, "pg_net: aborting request to %s (matched pg_net.blocked_cidrs)",
          conn_primary_ip);

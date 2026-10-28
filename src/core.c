@@ -75,7 +75,9 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   handle->id        = row.id;
   handle->body      = makeStringInfo();
   handle->ez_handle = curl_easy_init();
-  handle->block_reason[0] = '\0';
+  handle->block_reason[0]     = '\0';
+  handle->ip_blocked          = false;
+  handle->ip_socket_created   = false;
 
   // libcurl treats a 0 timeout as no timeout, and a request that never finishes blocks the batch
   // loop forever. Requests outside the bound are not sent, they get an error response instead. The
@@ -142,10 +144,16 @@ void init_curl_handle(CurlHandle *handle, RequestQueueRow row) {
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_TIMEOUT_MS, (long)handle->timeout_milliseconds);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PRIVATE, handle);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_FOLLOWLOCATION, (long)true);
-  // Register a pre-connect hook to enforce pg_net.allowed_cidrs /
-  // pg_net.blocked_cidrs. This fires after DNS + TCP but before any request
-  // bytes are sent, and it runs again on each redirect hop, so it cannot be
-  // bypassed by a 302 or DNS rebinding trick.
+  // Enforce pg_net.allowed_cidrs / pg_net.blocked_cidrs before any connection
+  // is made. The opensocket callback runs for every new connection (including
+  // each redirect hop) and receives the resolved destination, so a blocked
+  // destination is never connected to and cannot be reached via a 302 or DNS
+  // rebinding.
+  EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_OPENSOCKETFUNCTION, pg_net_opensocket_cb);
+  EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_OPENSOCKETDATA, handle);
+  // Backstop for connections that skip the opensocket callback, notably reused
+  // keep-alive connections: re-check the peer before the request is sent so a
+  // rule tightened at runtime (SIGHUP) also applies to them.
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PREREQFUNCTION, pg_net_prereq_cb);
   EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_PREREQDATA, handle);
   if (LOG_MIN_MESSAGES <= DEBUG2) EREPORT_CURL_SETOPT(handle->ez_handle, CURLOPT_VERBOSE, 1L);
@@ -319,6 +327,30 @@ void insert_rejected_response(CurlHandle *handle) {
   execute_insert_response(vals, nulls);
 }
 
+// Build an error_msg that explains an IP-filter rejection, or NULL when the
+// failure is not attributable to the filter so the caller falls back to the
+// generic message.
+//
+// Blocking a destination in the opensocket callback returns CURL_SOCKET_BAD,
+// which libcurl surfaces as CURLE_COULDNT_CONNECT -- the same code a genuine
+// network failure produces. The two are distinguished using the per-handle
+// state recorded by that callback:
+//   - no socket was ever created: every candidate was blocked, so the failure
+//     is unambiguously the filter's;
+//   - a socket was created but connecting still failed: some candidates were
+//     blocked and the remaining ones genuinely failed to connect.
+// Any other curl code is left to the generic handler, even if a candidate was
+// blocked along the way, so unrelated failures (OOM, TLS errors, ...) are not
+// misattributed to the filter.
+static char *ip_filter_error_msg(CurlHandle *handle, CURLcode code) {
+  if (!handle->ip_blocked || code != CURLE_COULDNT_CONNECT) return NULL;
+
+  if (!handle->ip_socket_created)
+    return psprintf("%s (no connection attempted)", handle->block_reason);
+
+  return psprintf("%s; connection failed: %s", handle->block_reason, curl_easy_strerror(code));
+}
+
 void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
   enum { nparams = response_nparams };
   Datum vals[nparams];
@@ -372,11 +404,19 @@ void insert_response(CurlHandle *handle, CURLcode curl_return_code) {
       vals[6]  = CStringGetTextDatum(handle->block_reason);
       nulls[6] = ' ';
     } else {
-      const char *error_msg = curl_easy_strerror(curl_return_code);
+      char *ip_msg = ip_filter_error_msg(handle, curl_return_code);
 
-      if (error_msg) {
-        vals[6]  = CStringGetTextDatum(error_msg);
+      if (ip_msg) {
+        vals[6]  = CStringGetTextDatum(ip_msg);
         nulls[6] = ' ';
+        pfree(ip_msg);
+      } else {
+        const char *error_msg = curl_easy_strerror(curl_return_code);
+
+        if (error_msg) {
+          vals[6]  = CStringGetTextDatum(error_msg);
+          nulls[6] = ' ';
+        }
       }
     }
   }

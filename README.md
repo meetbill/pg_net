@@ -140,7 +140,7 @@ The extension creates the following configurable variables:
 3. **pg_net.database_name** _(default: 'postgres')_: A string that defines which database the extension is applied to
 4. **pg_net.username** _(default: NULL)_: A string that defines which user will the background worker be connected with. If not set (`NULL`), it will assume the bootstrap user.
 5. **pg_net.max_timeout_ms** _(default: 600000)_: An integer that bounds the `timeout_milliseconds` of a request. A request with a timeout outside `1..pg_net.max_timeout_ms` is not sent and gets an `ERROR` response saying so, so every request has a finite lifetime and a single request can't block the others. Only superusers can change it.
-6. **pg_net.blocked_cidrs** _(default: '')_: A comma-separated list of CIDRs that requests are forbidden from connecting to. The check runs after DNS resolution and on every redirect hop, so it cannot be bypassed by DNS rebinding or `3xx` redirects to internal addresses. Blocked requests fail with `error_msg` `blocked by pg_net.blocked_cidrs: destination <ip>`.
+6. **pg_net.blocked_cidrs** _(default: '')_: A comma-separated list of CIDRs that requests are forbidden from connecting to. The check runs before a connection is opened and on every redirect hop, so a blocked destination is never connected to and it cannot be bypassed by DNS rebinding or `3xx` redirects to internal addresses. Blocked requests fail with `error_msg` `pg_net.ip_filter_blocked: destination <ip> matched pg_net.blocked_cidrs`.
 7. **pg_net.allowed_cidrs** _(default: '')_: A comma-separated list of CIDRs that are always allowed, taking precedence over `pg_net.blocked_cidrs`. Useful when you want to block an entire range but keep a specific host reachable.
 
 All these variables can be viewed with the following commands:
@@ -190,9 +190,13 @@ addresses. In shared or cloud environments this is an SSRF surface: the worker c
 loopback (`127.0.0.1`), the cloud metadata endpoint (`169.254.169.254`), or internal ranges.
 
 `pg_net.blocked_cidrs` and `pg_net.allowed_cidrs` let you constrain where requests may connect. The
-check is enforced inside libcurl's pre-connect callback, which runs **after DNS resolution and on
-every redirect hop** — so it also stops `3xx` redirects and DNS rebinding that point at an otherwise
-forbidden IP.
+check is enforced inside libcurl's pre-connect callback, which runs **before a connection is opened
+and on every redirect hop** — a blocked destination is never connected to, and the restriction cannot
+be bypassed by `3xx` redirects or DNS rebinding that point at an otherwise forbidden IP. A
+post-connect callback re-checks reused keep-alive connections, so tightening the rules at runtime
+(`SIGHUP`) also applies to connections that are already established.
+
+See [docs/ip_filter.md](docs/ip_filter.md) for a detailed guide (in Chinese).
 
 Matching order per connection attempt:
 
@@ -218,8 +222,21 @@ alter system set pg_net.allowed_cidrs to '10.0.5.100/32';
 select pg_reload_conf();
 ```
 
-A request blocked by this filter appears in `net._http_response` with a `null` `status_code` and an
-`error_msg` of `blocked by pg_net.blocked_cidrs: destination <ip>`.
+A request blocked by this filter appears in `net._http_response` with a `null` `status_code`, a
+`false` `timed_out`, and an `error_msg` that starts with a stable error code:
+
+| `error_msg` prefix | Meaning |
+|---|---|
+| `pg_net.ip_filter_blocked` | The destination matched `pg_net.blocked_cidrs`. The message names the IP and, when no connection was attempted at all, ends with `(no connection attempted)`. |
+| `pg_net.ip_filter_unparseable` | Rules are configured but the destination could not be inspected; the request is rejected (fail closed). |
+
+For example: `pg_net.ip_filter_blocked: destination 10.0.0.5 matched pg_net.blocked_cidrs (no
+connection attempted)`.
+
+> [!NOTE]
+> If some resolved addresses are blocked and the remaining ones genuinely fail to connect, the
+> message combines both facts, e.g. `... matched pg_net.blocked_cidrs; connection failed: Couldn't
+> connect to server`. This distinguishes an IP-filter rejection from an ordinary network failure.
 
 > [!NOTE]
 > This filter applies to the loopback interface too, which a network firewall or cloud security
@@ -229,13 +246,13 @@ A request blocked by this filter appears in `net._http_response` with a `null` `
 
 ### What it protects against
 
-The check runs on **every TCP connection libcurl opens**, including each redirect hop, so all of the
-following point at the destination that is actually being contacted (not what the user typed):
+The check runs on **every connection attempt libcurl makes**, including each redirect hop, so all of
+the following point at the destination that is actually being contacted (not what the user typed):
 
 - Direct connects — the IP libcurl resolved from the URL is checked.
 - `3xx` redirects to an internal address — a `Location:` header pointing at `127.0.0.1`,
-  `169.254.169.254`, or any other blocked range triggers a fresh connection, which fires the callback
-  again and is aborted.
+  `169.254.169.254`, or any other blocked range triggers a fresh connection attempt, which is
+  rejected before any socket is opened.
 - DNS rebinding — the IP checked is the one from the *current* resolution, not the hostname the user
   supplied; a domain that flips its A record between requests is caught on each new connection.
 - Same-host redirects that reuse an existing connection are still safe: the peer IP hasn't changed,

@@ -1,9 +1,11 @@
 """IP filter (pg_net.allowed_cidrs / pg_net.blocked_cidrs) integration tests.
 
-These tests exercise the pre-connect callback wired into libcurl. The prereq
-hook runs after DNS + TCP but before any request bytes leave the process,
-so a blocked request should surface as an error row in `net._http_response`
-with a specific `error_msg`, not as a timeout or a successful response.
+These tests exercise the pre-connect callback wired into libcurl. The
+opensocket hook runs before a socket is created (and on every redirect hop),
+so a blocked destination is never connected to and a blocked request should
+surface as an error row in `net._http_response` with a specific `error_msg`
+that starts with the stable `pg_net.ip_filter_blocked` code, not as a timeout
+or a successful response.
 
 Notes:
 - Both GUCs are PGC_SIGHUP; changes propagate to the worker via
@@ -82,8 +84,12 @@ def test_blocked_cidr_aborts_request(sess, autocommit_sess):
         assert status_code is None, "blocked request must not have an HTTP status"
         assert timed_out is False, "blocked request must not be reported as a timeout"
         assert error_msg is not None
-        assert "blocked by pg_net.blocked_cidrs" in error_msg, (
+        assert error_msg.startswith("pg_net.ip_filter_blocked"), (
             f"unexpected error_msg: {error_msg!r}"
+        )
+        assert "pg_net.blocked_cidrs" in error_msg
+        assert "(no connection attempted)" in error_msg, (
+            f"blocked request must not have attempted a connection: {error_msg!r}"
         )
     finally:
         _reset_ip_filters(autocommit_sess)
@@ -113,7 +119,7 @@ def test_allowed_cidr_overrides_blocked(sess, autocommit_sess):
             f"whitelisted request should succeed, "
             f"got status={status_code}, error={error_msg!r}"
         )
-        assert error_msg is None or "blocked by pg_net" not in (error_msg or "")
+        assert error_msg is None or "pg_net.ip_filter" not in (error_msg or "")
     finally:
         _reset_ip_filters(autocommit_sess)
 
@@ -168,6 +174,6 @@ def test_redirect_target_is_covered_by_the_filter(sess, autocommit_sess):
             "redirect should not have been followed to success"
         )
         assert error_msg is not None
-        assert "blocked by pg_net.blocked_cidrs" in error_msg
+        assert error_msg.startswith("pg_net.ip_filter_blocked")
     finally:
         _reset_ip_filters(autocommit_sess)
